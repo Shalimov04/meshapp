@@ -546,24 +546,46 @@
     -fx-stroke-dash-array: 10 7;
 }
 
+.map-trace-line-gap {
+    -fx-stroke-dash-array: 4 7;
+}
+
+.map-trace-label-leader {
+    -fx-stroke-width: 1;
+    -fx-opacity: 0.7;
+}
+
 .map-trace-arrow {
     -fx-opacity: 0.92;
 }
 
-.map-trace-signal-label {
-    -fx-background-color: rgba(0, 0, 0, 0.64);
+.map-trace-signal-label,
+.map-trace-overflow {
+    -fx-background-color: #19232d;
     -fx-background-radius: 5;
     -fx-border-radius: 5;
     -fx-border-width: 1;
     -fx-padding: 2 6 2 6;
-    -fx-text-fill: rgba(255, 255, 255, 0.92);
+    -fx-text-fill: #f4f7fa;
     -fx-font-size: 0.7692em;
     -fx-font-weight: bold;
 }
 
-.light-theme .map-trace-signal-label {
-    -fx-background-color: rgba(255, 255, 255, 0.88);
-    -fx-text-fill: rgba(0, 0, 0, 0.76);
+.light-theme .map-trace-signal-label,
+.light-theme .map-trace-overflow {
+    -fx-background-color: #ffffff;
+    -fx-text-fill: #19232d;
+}
+
+.map-trace-signal-label-selected,
+.map-trace-signal-label:focused,
+.map-trace-overflow:focused {
+    -fx-border-width: 2;
+    -fx-padding: 1 5 1 5;
+}
+
+.map-trace-overflow {
+    -fx-border-color: -color-border-default;
 }
 
 .tile-map-view {

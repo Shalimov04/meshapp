@@ -5,9 +5,12 @@ import com.meshtastic.client.i18n.I18n;
 import javafx.application.Platform;
 import javafx.geometry.Point2D;
 import javafx.geometry.Pos;
+import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
 import javafx.scene.Node;
 import javafx.scene.control.Label;
+import javafx.scene.control.ContextMenu;
+import javafx.scene.control.MenuItem;
 import javafx.scene.control.OverrunStyle;
 import javafx.scene.control.Tooltip;
 import javafx.scene.image.Image;
@@ -16,14 +19,18 @@ import javafx.scene.image.PixelReader;
 import javafx.scene.image.PixelWriter;
 import javafx.scene.image.WritableImage;
 import javafx.scene.input.MouseButton;
+import javafx.scene.input.KeyCode;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.StackPane;
 import javafx.scene.shape.Circle;
+import javafx.scene.shape.CubicCurve;
 import javafx.scene.shape.Line;
 import javafx.scene.shape.Polygon;
 import javafx.scene.shape.Polyline;
 import javafx.scene.shape.Rectangle;
+import javafx.scene.shape.QuadCurve;
+import javafx.scene.shape.Shape;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
 import javafx.scene.text.Text;
@@ -40,6 +47,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -91,6 +99,7 @@ public class TileMapView extends StackPane {
     private final Pane areaLayer = new Pane();
     private final Pane traceLayer = new Pane();
     private final Pane markerLayer = new Pane();
+    private final Pane traceLabelLayer = new Pane();
     private final Pane measureLayer = new Pane();
     private final Label attributionLabel = new Label();
     private final HttpClient httpClient = HttpClient.newBuilder()
@@ -125,6 +134,8 @@ public class TileMapView extends StackPane {
 
     private List<MapMarker> markers = List.of();
     private List<TraceSegment> traceSegments = List.of();
+    private String selectedTraceKey;
+    private ContextMenu traceOverflowMenu;
     private TileSource tileSource = TileSource.configured(System.getProperties());
     private Path externalTileRoot;
     private GeoBounds selectedArea;
@@ -170,16 +181,18 @@ public class TileMapView extends StackPane {
         areaLayer.getStyleClass().add("map-area-layer");
         areaLayer.setMouseTransparent(true);
         traceLayer.getStyleClass().add("map-trace-layer");
-        traceLayer.setMouseTransparent(true);
+        traceLayer.setPickOnBounds(false);
         markerLayer.getStyleClass().add("map-marker-layer");
         markerLayer.setPickOnBounds(false);
+        traceLabelLayer.getStyleClass().add("map-trace-label-layer");
+        traceLabelLayer.setPickOnBounds(false);
         measureLayer.getStyleClass().add("map-measure-layer");
         measureLayer.setMouseTransparent(true);
         attributionLabel.getStyleClass().add("map-attribution-label");
         attributionLabel.setMouseTransparent(true);
         attributionLabel.setText(tileSource.attribution());
 
-        getChildren().addAll(tileLayer, areaLayer, traceLayer, markerLayer, measureLayer, attributionLabel);
+        getChildren().addAll(tileLayer, areaLayer, traceLayer, markerLayer, traceLabelLayer, measureLayer, attributionLabel);
         StackPane.setAlignment(attributionLabel, Pos.BOTTOM_LEFT);
 
         widthProperty().addListener((obs, oldValue, newValue) -> render());
@@ -487,12 +500,22 @@ public class TileMapView extends StackPane {
      */
     public void setTraceSegments(List<TraceSegment> traceSegments) {
         this.traceSegments = traceSegments != null ? List.copyOf(traceSegments) : List.of();
+        if (this.traceSegments.stream().noneMatch(segment -> traceKey(segment).equals(selectedTraceKey))) {
+            selectedTraceKey = null;
+        }
+        if (traceOverflowMenu != null) {
+            traceOverflowMenu.hide();
+        }
         updateTraceOverlay();
     }
 
     /** Hides all traces from the map. */
     public void clearTraceSegments() {
         this.traceSegments = List.of();
+        selectedTraceKey = null;
+        if (traceOverflowMenu != null) {
+            traceOverflowMenu.hide();
+        }
         updateTraceOverlay();
     }
 
@@ -524,8 +547,8 @@ public class TileMapView extends StackPane {
             return true;
         }
 
-        double availableWidth = Math.max(280, getWidth() - 112);
-        double availableHeight = Math.max(220, getHeight() - 112);
+        double availableWidth = Math.max(64, getWidth() - 112);
+        double availableHeight = Math.max(64, getHeight() - 112);
         int bestZoom = MIN_ZOOM;
         double bestCenterX = 0;
         double bestCenterY = 0;
@@ -1065,6 +1088,30 @@ public class TileMapView extends StackPane {
             markerNode.setLayoutY(screen.getY() - MARKER_SIZE / 2.0);
             markerLayer.getChildren().add(markerNode);
         }
+        updateTraceMarkerFocus();
+    }
+
+    private Set<GeoPoint> selectedTracePoints() {
+        Set<GeoPoint> points = new HashSet<>();
+        for (TraceSegment segment : traceSegments) {
+            if (traceKey(segment).equals(selectedTraceKey)) {
+                points.add(segment.from());
+                points.add(segment.to());
+            }
+        }
+        return points;
+    }
+
+    /** Keep route nodes usable while unrelated marker text recedes from its path. */
+    private void updateTraceMarkerFocus() {
+        boolean focused = selectedTraceKey != null;
+        Set<GeoPoint> points = selectedTracePoints();
+        for (Node node : markerLayer.getChildren()) {
+            if (node.getUserData() instanceof MapMarker marker) {
+                boolean routeNode = points.contains(new GeoPoint(marker.latitude(), marker.longitude()));
+                node.setOpacity(!focused || routeNode ? 1 : 0.14);
+            }
+        }
     }
 
     /**
@@ -1090,111 +1137,405 @@ public class TileMapView extends StackPane {
     }
 
     /**
-     * Redraws trace segments, SNR/hop labels, and direction arrows.
+     * Draws attached routes first, then lays out labels above the marker layer.
+     * Labels stay near their edge; details that cannot fit remain in an explicit
+     * overflow menu rather than overlapping or disappearing without explanation.
      */
     private void updateTraceOverlay() {
+        updateTraceOverlay(null);
+    }
+
+    private void updateTraceOverlay(TraceSegment preferredFocus) {
+        TraceFocus focus = captureTraceFocus(preferredFocus);
+        updateTraceMarkerFocus();
         traceLayer.getChildren().clear();
+        traceLabelLayer.getChildren().clear();
         if (getWidth() <= 0 || getHeight() <= 0 || traceSegments.isEmpty()) {
+            restoreTraceFocus(focus);
             return;
         }
 
+        Map<EdgeKey, List<TraceSegment>> sharedEdges = new LinkedHashMap<>();
         for (TraceSegment segment : traceSegments) {
-            if (!isValidCoordinate(segment.from().latitude(), segment.from().longitude())
-                    || !isValidCoordinate(segment.to().latitude(), segment.to().longitude())) {
-                continue;
+            if (isValidCoordinate(segment.from().latitude(), segment.from().longitude())
+                    && isValidCoordinate(segment.to().latitude(), segment.to().longitude())) {
+                sharedEdges.computeIfAbsent(edgeKey(segment), key -> new ArrayList<>()).add(segment);
             }
-            Point2D from = geoToScreen(segment.from().latitude(), segment.from().longitude());
-            Point2D to = geoToScreen(segment.to().latitude(), segment.to().longitude());
-            double dx = to.getX() - from.getX();
-            double dy = to.getY() - from.getY();
-            double length = Math.hypot(dx, dy);
-            if (length < 1.0) {
-                continue;
+        }
+        List<TraceVisual> visuals = new ArrayList<>();
+        for (List<TraceSegment> shared : sharedEdges.values()) {
+            // Persistent identity determines lane order, with no five-trace wraparound.
+            shared.sort(Comparator.comparingLong(TraceSegment::traceId)
+                    .thenComparingInt(TraceSegment::traceIndex).thenComparing(TraceSegment::reverse));
+            for (int index = 0; index < shared.size(); index++) {
+                TraceSegment segment = shared.get(index);
+                Point2D from = geoToScreen(segment.from().latitude(), segment.from().longitude());
+                Point2D to = geoToScreen(segment.to().latitude(), segment.to().longitude());
+                double world = worldSize(zoom);
+                double dx = to.getX() - from.getX();
+                if (Math.abs(dx) > world / 2) {
+                    // The nearest endpoint copy must follow the shortest geographic link.
+                    to = to.add(dx > 0 ? -world : world, 0);
+                }
+                double spacing = shared.size() <= 1 ? 0 : Math.min(20, 240.0 / (shared.size() - 1));
+                double lane = (index - (shared.size() - 1) / 2.0) * spacing;
+                TraceGeometry geometry = traceGeometry(segment, from, to, lane, index);
+                Shape path = geometry.shape();
+                path.getStyleClass().add("map-trace-line");
+                if (segment.reverse()) {
+                    path.getStyleClass().add("map-trace-line-reverse");
+                }
+                if (segment.hiddenHopCount() > 0) {
+                    path.getStyleClass().add("map-trace-line-gap");
+                }
+                boolean selected = traceKey(segment).equals(selectedTraceKey);
+                String color = traceColor(segment.reverse());
+                path.setStyle("-fx-stroke: " + color + "; -fx-fill: null;"
+                        + (selected ? " -fx-stroke-width: 5; -fx-opacity: 1;"
+                        : selectedTraceKey != null ? " -fx-opacity: 0.22;" : ""));
+                path.setUserData(segment);
+                path.setCursor(Cursor.HAND);
+                path.setOnMouseClicked(event -> {
+                    if (!measuring && !areaSelectionMode && !dragged && event.getButton() == MouseButton.PRIMARY) {
+                        selectTrace(segment);
+                        event.consume();
+                    }
+                });
+                Tooltip.install(path, new Tooltip(traceDetails(segment)));
+                traceLayer.getChildren().add(path);
+                double arrowOpacity = selectedTraceKey == null || selected ? 0.92 : 0.22;
+                addTraceArrow(geometry, 0.42, color, arrowOpacity);
+                if (from.distance(to) > 180) {
+                    addTraceArrow(geometry, 0.72, color, arrowOpacity);
+                }
+                visuals.add(new TraceVisual(segment, geometry));
             }
+        }
+        layoutTraceLabels(visuals);
+        restoreTraceFocus(focus);
+    }
 
-            double canonicalDx = shouldFlipTraceNormal(segment) ? -dx : dx;
-            double canonicalDy = shouldFlipTraceNormal(segment) ? -dy : dy;
-            double nx = -canonicalDy / length;
-            double ny = canonicalDx / length;
-            double traceOffset = ((segment.traceIndex() % 5) - 2) * 18.0;
-            double directionOffset = segment.reverse() ? 7.0 : -7.0;
-            double offset = traceOffset + directionOffset;
-            double x1 = from.getX() + nx * offset;
-            double y1 = from.getY() + ny * offset;
-            double x2 = to.getX() + nx * offset;
-            double y2 = to.getY() + ny * offset;
-            String color = traceColor(segment.reverse());
+    /** Capture only focus owned by this overlay; toolbar and other controls keep theirs. */
+    private TraceFocus captureTraceFocus(TraceSegment preferredFocus) {
+        Node owner = getScene() == null ? null : getScene().getFocusOwner();
+        if (owner == null || owner.getParent() != traceLabelLayer) {
+            return null;
+        }
+        if (owner.getStyleClass().contains("map-trace-overflow")) {
+            return new TraceFocus(preferredFocus, true);
+        }
+        return owner.getUserData() instanceof TraceSegment segment ? new TraceFocus(segment, false) : null;
+    }
 
-            Line line = new Line(x1, y1, x2, y2);
-            line.getStyleClass().add("map-trace-line");
-            if (segment.reverse()) {
-                line.getStyleClass().add("map-trace-line-reverse");
+    private void restoreTraceFocus(TraceFocus focus) {
+        if (focus == null) {
+            return;
+        }
+        // The replacement must be attached and sized before it can own keyboard focus.
+        traceLabelLayer.layout();
+        Node overflow = null;
+        Node selected = null;
+        Node first = null;
+        for (Node node : traceLabelLayer.getChildren()) {
+            if (node.getStyleClass().contains("map-trace-overflow")) {
+                overflow = node;
+            } else if (node.getUserData() instanceof TraceSegment segment) {
+                if (focus.segment() != null && sameTraceLabel(segment, focus.segment())) {
+                    node.requestFocus();
+                    return;
+                }
+                if (traceKey(segment).equals(selectedTraceKey) && selected == null) {
+                    selected = node;
+                }
+                if (first == null) {
+                    first = node;
+                }
             }
-            line.setStyle("-fx-stroke: " + color + ";");
-            traceLayer.getChildren().add(line);
-
-            addTraceArrow(x1, y1, x2, y2, 0.42, color);
-            if (length > 96.0) {
-                addTraceArrow(x1, y1, x2, y2, 0.68, color);
-            }
-
-            Label signalLabel = new Label(segment.signalText());
-            signalLabel.getStyleClass().add("map-trace-signal-label");
-            signalLabel.setStyle("-fx-border-color: " + color + ";");
-            signalLabel.applyCss();
-            signalLabel.autosize();
-            signalLabel.setLayoutX((x1 + x2) / 2.0 + nx * 12.0 - signalLabel.prefWidth(-1) / 2.0);
-            signalLabel.setLayoutY((y1 + y2) / 2.0 + ny * 12.0 - signalLabel.prefHeight(-1) / 2.0);
-            traceLayer.getChildren().add(signalLabel);
+        }
+        if (overflow != null) {
+            overflow.requestFocus();
+        } else if (focus.overflow() && selected != null) {
+            selected.requestFocus();
+        } else if (focus.overflow() && first != null) {
+            first.requestFocus();
+        } else {
+            requestFocus();
         }
     }
 
-    /**
-     * Chooses a stable offset side for a trace line so forward and reverse
-     * directions do not overlap.
-     */
+    private boolean sameTraceLabel(TraceSegment first, TraceSegment second) {
+        return traceKey(first).equals(traceKey(second)) && first.reverse() == second.reverse()
+                && first.from().equals(second.from()) && first.to().equals(second.to());
+    }
+
+    private TraceGeometry traceGeometry(TraceSegment segment, Point2D from, Point2D to,
+                                        double lane, int index) {
+        Point2D delta = to.subtract(from);
+        if (delta.magnitude() < 1) {
+            // A local link is real data, even though its geographic length is zero.
+            // The loop returns to the same node instead of silently losing a link.
+            double radius = 28 + index * Math.min(9, 100.0 / (index + 1));
+            double side = index % 2 == 0 ? 1 : -1;
+            Point2D first = from.add(-radius * side, -radius * 1.8);
+            Point2D second = from.add(radius * side, -radius * 1.8);
+            if (segment.reverse()) {
+                Point2D swap = first;
+                first = second;
+                second = swap;
+            }
+            CubicCurve loop = new CubicCurve(from.getX(), from.getY(), first.getX(), first.getY(),
+                    second.getX(), second.getY(), to.getX(), to.getY());
+            return new TraceGeometry(from, first, second, to, loop, true);
+        }
+        Point2D normal = new Point2D(-delta.getY(), delta.getX()).normalize();
+        if (shouldFlipTraceNormal(segment)) {
+            normal = normal.multiply(-1);
+        }
+        Point2D control = from.midpoint(to).add(normal.multiply(lane * 2));
+        QuadCurve curve = new QuadCurve(from.getX(), from.getY(), control.getX(), control.getY(),
+                to.getX(), to.getY());
+        return new TraceGeometry(from, control, control, to, curve, false);
+    }
+
+    private void layoutTraceLabels(List<TraceVisual> visuals) {
+        List<Rectangle2D> occupied = new ArrayList<>();
+        Set<GeoPoint> focusedPoints = selectedTracePoints();
+        for (MapMarker marker : markers) {
+            if (selectedTraceKey != null
+                    && !focusedPoints.contains(new GeoPoint(marker.latitude(), marker.longitude()))) {
+                continue;
+            }
+            Point2D point = geoToScreen(marker.latitude(), marker.longitude());
+            if (point.getX() >= -MARKER_SIZE && point.getX() <= getWidth() + MARKER_SIZE
+                    && point.getY() >= -MARKER_SIZE && point.getY() <= getHeight() + MARKER_SIZE) {
+                occupied.add(new Rectangle2D(point.getX() - MARKER_SIZE / 2 - 4,
+                        point.getY() - MARKER_SIZE / 2 - 4, MARKER_SIZE + 8, MARKER_SIZE + 8));
+            }
+        }
+        // Reserve a stable, uncluttered place for overflow before placing any labels.
+        double overflowWidth = Math.min(180, Math.max(60, getWidth() - 16));
+        Rectangle2D overflowArea = new Rectangle2D(Math.max(8, getWidth() - overflowWidth - 8),
+                8, overflowWidth, 30);
+        occupied.add(overflowArea);
+        occupied.add(new Rectangle2D(0, Math.max(0, getHeight() - 25), 170, 25));
+        visuals.sort(Comparator.comparing((TraceVisual visual) ->
+                !traceKey(visual.segment()).equals(selectedTraceKey)));
+        List<TraceSegment> overflow = new ArrayList<>();
+        for (TraceVisual visual : visuals) {
+            TraceSegment segment = visual.segment();
+            // Full identity/time and signal remain available in every tooltip/menu.
+            Label label = new Label(visuals.size() > 8 ? compactTraceText(segment) : fullTraceText(segment));
+            label.getStyleClass().add("map-trace-signal-label");
+            if (traceKey(segment).equals(selectedTraceKey)) {
+                label.getStyleClass().add("map-trace-signal-label-selected");
+            }
+            label.setStyle("-fx-border-color: " + traceColor(segment.reverse()) + ";");
+            label.setUserData(segment);
+            traceLabelLayer.getChildren().add(label);
+            label.applyCss();
+            label.autosize();
+            LabelPlacement placement = placeTraceLabel(label, visual.geometry(), occupied);
+            if (placement == null && visuals.size() <= 8) {
+                label.setText(compactTraceText(segment));
+                label.autosize();
+                placement = placeTraceLabel(label, visual.geometry(), occupied);
+            }
+            if (placement == null) {
+                traceLabelLayer.getChildren().remove(label);
+                overflow.add(segment);
+                continue;
+            }
+            Rectangle2D bounds = placement.bounds();
+            label.resizeRelocate(bounds.getMinX(), bounds.getMinY(), bounds.getWidth(), bounds.getHeight());
+            occupied.add(new Rectangle2D(bounds.getMinX() - 3, bounds.getMinY() - 3,
+                    bounds.getWidth() + 6, bounds.getHeight() + 6));
+            Point2D anchor = placement.anchor();
+            double endX = Math.max(bounds.getMinX(), Math.min(bounds.getMaxX(), anchor.getX()));
+            double endY = Math.max(bounds.getMinY(), Math.min(bounds.getMaxY(), anchor.getY()));
+            if (anchor.distance(endX, endY) > 5) {
+                Line leader = new Line(anchor.getX(), anchor.getY(), endX, endY);
+                leader.getStyleClass().add("map-trace-label-leader");
+                leader.setStyle("-fx-stroke: " + traceColor(segment.reverse()) + ";");
+                leader.setMouseTransparent(true);
+                traceLabelLayer.getChildren().add(traceLabelLayer.getChildren().indexOf(label), leader);
+            }
+            configureTraceLabel(label, segment);
+        }
+        if (!overflow.isEmpty()) {
+            Label more = new Label(I18n.t("map.trace.more", overflow.size()));
+            more.getStyleClass().add("map-trace-overflow");
+            more.setUserData(List.copyOf(overflow));
+            more.setFocusTraversable(true);
+            more.setCursor(Cursor.HAND);
+            more.setMaxWidth(overflowWidth);
+            traceLabelLayer.getChildren().add(more);
+            more.applyCss();
+            more.autosize();
+            more.relocate(overflowArea.getMaxX() - more.getWidth(), overflowArea.getMinY());
+            more.setTooltip(new Tooltip(I18n.t("map.trace.more", overflow.size())));
+            Runnable openMenu = () -> showTraceOverflow(more, overflow);
+            more.setOnMouseClicked(event -> {
+                if (event.getButton() == MouseButton.PRIMARY && !measuring && !areaSelectionMode && !dragged) {
+                    openMenu.run();
+                    event.consume();
+                }
+            });
+            more.setOnKeyPressed(event -> {
+                if (event.getCode() == KeyCode.ENTER || event.getCode() == KeyCode.SPACE) {
+                    openMenu.run();
+                    event.consume();
+                }
+            });
+        }
+    }
+
+    /** A bounded search along the owning edge, with leader cues for displaced labels. */
+    private LabelPlacement placeTraceLabel(Label label, TraceGeometry geometry, List<Rectangle2D> occupied) {
+        double width = Math.ceil(label.prefWidth(-1));
+        double height = Math.ceil(label.prefHeight(-1));
+        double[] positions = {0.5, 0.32, 0.68, 0.18, 0.82};
+        double[] distances = {16, -16, 38, -38, 64, -64, 94, -94, 128, -128};
+        for (double distance : distances) {
+            for (double position : positions) {
+                Point2D anchor = geometry.point(position);
+                Point2D tangent = geometry.tangent(position);
+                Point2D normal = new Point2D(-tangent.getY(), tangent.getX()).normalize();
+                Point2D center = anchor.add(normal.multiply(distance));
+                Rectangle2D bounds = new Rectangle2D(center.getX() - width / 2,
+                        center.getY() - height / 2, width, height);
+                if (bounds.getMinX() >= 8 && bounds.getMinY() >= 8
+                        && bounds.getMaxX() <= getWidth() - 8 && bounds.getMaxY() <= getHeight() - 8
+                        && occupied.stream().noneMatch(rectangle -> rectangle.intersects(bounds))) {
+                    return new LabelPlacement(bounds, anchor);
+                }
+            }
+        }
+        return null;
+    }
+
+    private void configureTraceLabel(Label label, TraceSegment segment) {
+        label.setCursor(Cursor.HAND);
+        label.setFocusTraversable(true);
+        label.setAccessibleText(traceDetails(segment));
+        label.setTooltip(new Tooltip(traceDetails(segment)));
+        label.setOnMouseClicked(event -> {
+            if (!measuring && !areaSelectionMode && !dragged && event.getButton() == MouseButton.PRIMARY) {
+                label.requestFocus();
+                selectTrace(segment);
+                event.consume();
+            }
+        });
+        label.setOnKeyPressed(event -> {
+            if (event.getCode() == KeyCode.ENTER || event.getCode() == KeyCode.SPACE) {
+                selectTrace(segment);
+                event.consume();
+            }
+        });
+    }
+
+    private void showTraceOverflow(Label owner, List<TraceSegment> overflow) {
+        if (traceOverflowMenu != null) {
+            traceOverflowMenu.hide();
+        }
+        owner.requestFocus();
+        traceOverflowMenu = new ContextMenu();
+        for (TraceSegment segment : overflow) {
+            MenuItem item = new MenuItem(traceDetails(segment).replace('\n', ' '));
+            item.setOnAction(event -> selectTrace(segment));
+            traceOverflowMenu.getItems().add(item);
+        }
+        traceOverflowMenu.show(owner, javafx.geometry.Side.BOTTOM, 0, 4);
+    }
+
+    private void selectTrace(TraceSegment segment) {
+        String key = traceKey(segment);
+        selectedTraceKey = key.equals(selectedTraceKey) ? null : key;
+        updateTraceOverlay(segment);
+    }
+
+    private String fullTraceText(TraceSegment segment) {
+        return segment.traceLabel() + " · " + segment.signalText();
+    }
+
+    private String compactTraceText(TraceSegment segment) {
+        String identity = segment.traceId() != 0 ? "#" + segment.traceId() : "#" + (segment.traceIndex() + 1);
+        String signal = !Double.isFinite(segment.snr()) ? I18n.t("map.trace.snrUnavailable")
+                : segment.averagedSnr()
+                ? I18n.t("map.trace.compactMean", String.format(Locale.ROOT, "%.1f", segment.snr()), I18n.t("node.unit.db"))
+                : "SNR " + String.format(Locale.ROOT, "%.1f", segment.snr()) + " " + I18n.t("node.unit.db");
+        // A bridged gap and an average remain explicit even in compact labels.
+        return identity + " " + (segment.reverse() ? "←" : "→") + " · " + signal
+                + (segment.hiddenHopCount() > 0 ? " · " + I18n.t("map.trace.compactGap", segment.hiddenHopCount()) : "");
+    }
+
+    private String traceDetails(TraceSegment segment) {
+        return segment.traceLabel() + " · " + segment.traceTitle() + "\n"
+                + segment.fromTitle() + " → " + segment.toTitle() + "\n" + segment.signalText();
+    }
+
+    private static String traceKey(TraceSegment segment) {
+        return segment.traceId() != 0 ? "id:" + segment.traceId() : "index:" + segment.traceIndex();
+    }
+
+    private EdgeKey edgeKey(TraceSegment segment) {
+        return shouldFlipTraceNormal(segment) ? new EdgeKey(segment.to(), segment.from())
+                : new EdgeKey(segment.from(), segment.to());
+    }
+
+    /** Stable orientation keeps reciprocal routes on distinct lanes. */
     private boolean shouldFlipTraceNormal(TraceSegment segment) {
         int latCompare = Double.compare(segment.from().latitude(), segment.to().latitude());
         if (latCompare != 0) {
             return latCompare > 0;
         }
-        int lonCompare = Double.compare(segment.from().longitude(), segment.to().longitude());
-        if (lonCompare != 0) {
-            return lonCompare > 0;
-        }
-        return segment.fromTitle().compareToIgnoreCase(segment.toTitle()) > 0;
+        return Double.compare(segment.from().longitude(), segment.to().longitude()) > 0;
     }
 
-    /**
-     * Adds a direction arrow to a trace segment.
-     *
-     * @param position fraction of the segment length where the arrow is placed
-     */
-    private void addTraceArrow(double x1, double y1, double x2, double y2, double position, String color) {
-        double x = x1 + (x2 - x1) * position;
-        double y = y1 + (y2 - y1) * position;
+    private void addTraceArrow(TraceGeometry geometry, double position, String color, double opacity) {
+        Point2D point = geometry.point(position);
+        Point2D tangent = geometry.tangent(position);
         Polygon arrow = new Polygon(-6, -5, 7, 0, -6, 5);
         arrow.getStyleClass().add("map-trace-arrow");
-        arrow.setStyle("-fx-fill: " + color + ";");
-        arrow.setLayoutX(x);
-        arrow.setLayoutY(y);
-        arrow.setRotate(Math.toDegrees(Math.atan2(y2 - y1, x2 - x1)));
+        arrow.setStyle("-fx-fill: " + color + "; -fx-opacity: " + opacity + ";");
+        arrow.setLayoutX(point.getX());
+        arrow.setLayoutY(point.getY());
+        arrow.setRotate(Math.toDegrees(Math.atan2(tangent.getY(), tangent.getX())));
+        arrow.setMouseTransparent(true);
         traceLayer.getChildren().add(arrow);
     }
 
-    /**
-     * Returns the trace-line color for the forward or reverse direction.
-     */
     private String traceColor(boolean reverse) {
         return reverse ? TRACE_REVERSE_COLOR : TRACE_FORWARD_COLOR;
+    }
+
+    private record EdgeKey(GeoPoint first, GeoPoint second) {}
+    private record TraceFocus(TraceSegment segment, boolean overflow) {}
+    private record TraceVisual(TraceSegment segment, TraceGeometry geometry) {}
+    private record LabelPlacement(Rectangle2D bounds, Point2D anchor) {}
+
+    private record TraceGeometry(Point2D from, Point2D first, Point2D second, Point2D to,
+                                 Shape shape, boolean cubic) {
+        Point2D point(double t) {
+            double u = 1 - t;
+            return cubic ? from.multiply(u * u * u).add(first.multiply(3 * u * u * t))
+                    .add(second.multiply(3 * u * t * t)).add(to.multiply(t * t * t))
+                    : from.multiply(u * u).add(first.multiply(2 * u * t)).add(to.multiply(t * t));
+        }
+        Point2D tangent(double t) {
+            double u = 1 - t;
+            return cubic ? first.subtract(from).multiply(3 * u * u)
+                    .add(second.subtract(first).multiply(6 * u * t))
+                    .add(to.subtract(second).multiply(3 * t * t))
+                    : first.subtract(from).multiply(2 * u).add(to.subtract(first).multiply(2 * t));
+        }
     }
 
     /**
      * Builds a screen rectangle for the geographic bounds of the selected area.
      */
     private Rectangle rectangleForArea(GeoBounds area) {
-        Point2D topLeft = geoToScreen(area.north(), area.west());
-        Point2D bottomRight = geoToScreen(area.south(), area.east());
+        Point2D topLeft = geoToScreenUnwrapped(area.north(), area.west());
+        Point2D bottomRight = geoToScreenUnwrapped(area.south(), area.east());
         return rectangleForScreenBounds(topLeft.getX(), topLeft.getY(), bottomRight.getX(), bottomRight.getY());
     }
 
@@ -1285,6 +1626,7 @@ public class TileMapView extends StackPane {
         label.setFont(Font.font(Font.getDefault().getFamily(), FontWeight.BOLD, fitMarkerFontSize(markerText)));
 
         StackPane pin = new StackPane(label);
+        pin.setUserData(marker);
         pin.getStyleClass().add("map-node-marker");
         if (marker.local()) {
             pin.getStyleClass().add("map-node-marker-local");
@@ -1355,7 +1697,7 @@ public class TileMapView extends StackPane {
             Polyline line = new Polyline();
             line.getStyleClass().add("map-measure-line");
             for (GeoPoint point : measurePoints) {
-                Point2D screen = geoToScreen(point.latitude(), point.longitude());
+                Point2D screen = geoToScreenUnwrapped(point.latitude(), point.longitude());
                 line.getPoints().addAll(screen.getX(), screen.getY());
             }
             measureLayer.getChildren().add(line);
@@ -1363,7 +1705,7 @@ public class TileMapView extends StackPane {
 
         for (int i = 0; i < measurePoints.size(); i++) {
             GeoPoint point = measurePoints.get(i);
-            Point2D screen = geoToScreen(point.latitude(), point.longitude());
+            Point2D screen = geoToScreenUnwrapped(point.latitude(), point.longitude());
             Circle circle = new Circle(5);
             circle.getStyleClass().add("map-measure-point");
             circle.setCenterX(screen.getX());
@@ -1372,7 +1714,7 @@ public class TileMapView extends StackPane {
 
             if (i > 0) {
                 GeoPoint previous = measurePoints.get(i - 1);
-                Point2D previousScreen = geoToScreen(previous.latitude(), previous.longitude());
+                Point2D previousScreen = geoToScreenUnwrapped(previous.latitude(), previous.longitude());
                 double distance = distanceMeters(previous, point);
                 Label segment = new Label(formatDistance(distance));
                 segment.getStyleClass().add("map-measure-segment-label");
@@ -1462,10 +1804,20 @@ public class TileMapView extends StackPane {
      * Converts geographic coordinates to a screen point inside the component.
      */
     private Point2D geoToScreen(double latitude, double longitude) {
-        double centerX = lonToPixelX(centerLongitude, zoom);
-        double centerY = latToPixelY(centerLatitude, zoom);
-        double x = lonToPixelX(longitude, zoom) - centerX + getWidth() / 2.0;
-        double y = latToPixelY(latitude, zoom) - centerY + getHeight() / 2.0;
+        Point2D point = geoToScreenUnwrapped(latitude, longitude);
+        double world = worldSize(zoom);
+        double dx = point.getX() - getWidth() / 2.0;
+        // Markers and traces use the world copy nearest to the view centre.
+        return new Point2D(point.getX() - Math.floor(dx / world + 0.5) * world, point.getY());
+    }
+
+    /**
+     * Converts geographic coordinates without wrapping, so areas and measurement
+     * legs wider than half the world keep their continuous shape.
+     */
+    private Point2D geoToScreenUnwrapped(double latitude, double longitude) {
+        double x = lonToPixelX(longitude, zoom) - lonToPixelX(centerLongitude, zoom) + getWidth() / 2.0;
+        double y = latToPixelY(latitude, zoom) - latToPixelY(centerLatitude, zoom) + getHeight() / 2.0;
         return new Point2D(x, y);
     }
 
@@ -1484,20 +1836,31 @@ public class TileMapView extends StackPane {
      * Computes the pixel bounds of an arbitrary set of geographic points.
      */
     private Bounds pointBounds(List<GeoPoint> points, int candidateZoom) {
-        double minX = Double.POSITIVE_INFINITY;
+        List<Double> xs = new ArrayList<>();
         double minY = Double.POSITIVE_INFINITY;
-        double maxX = Double.NEGATIVE_INFINITY;
         double maxY = Double.NEGATIVE_INFINITY;
-
         for (GeoPoint point : points) {
-            double x = lonToPixelX(point.longitude(), candidateZoom);
+            xs.add(lonToPixelX(point.longitude(), candidateZoom));
             double y = latToPixelY(point.latitude(), candidateZoom);
-            minX = Math.min(minX, x);
             minY = Math.min(minY, y);
-            maxX = Math.max(maxX, x);
             maxY = Math.max(maxY, y);
         }
-
+        xs.sort(Double::compare);
+        double world = worldSize(candidateZoom);
+        // Cut the longitude circle at its largest empty arc. The remaining arc
+        // is the smallest bounds, including routes that cross the antimeridian.
+        double largestGap = -1;
+        int first = 0;
+        for (int index = 0; index < xs.size(); index++) {
+            int next = (index + 1) % xs.size();
+            double gap = xs.get(next) + (next == 0 ? world : 0) - xs.get(index);
+            if (gap > largestGap) {
+                largestGap = gap;
+                first = next;
+            }
+        }
+        double minX = xs.get(first);
+        double maxX = minX + world - largestGap;
         return new Bounds(minX, minY, maxX, maxY);
     }
 
@@ -1638,6 +2001,10 @@ public class TileMapView extends StackPane {
      * @param snr        numeric SNR, or {@link Double#NaN} when unavailable
      * @param reverse    {@code true} for the reverse direction
      * @param traceIndex selected trace index, used to spread lines apart
+     * @param traceId persistent identity, or zero for a legacy caller
+     * @param traceLabel persistent identity and saved time for display
+     * @param hiddenHopCount intermediate hops without coordinates
+     * @param averagedSnr true when SNR summarizes several measured hops
      */
     public record TraceSegment(
             GeoPoint from,
@@ -1648,8 +2015,18 @@ public class TileMapView extends StackPane {
             String signalText,
             double snr,
             boolean reverse,
-            int traceIndex
+            int traceIndex,
+            long traceId,
+            String traceLabel,
+            int hiddenHopCount,
+            boolean averagedSnr
     ) {
+        /** Compatibility constructor for callers without persistent trace metadata. */
+        public TraceSegment(GeoPoint from, GeoPoint to, String fromTitle, String toTitle,
+                            String traceTitle, String signalText, double snr, boolean reverse, int traceIndex) {
+            this(from, to, fromTitle, toTitle, traceTitle, signalText, snr, reverse, traceIndex,
+                    0, "#" + (traceIndex + 1), 0, false);
+        }
     }
 
     /**

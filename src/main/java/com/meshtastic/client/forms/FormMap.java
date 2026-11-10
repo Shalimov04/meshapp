@@ -56,11 +56,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.IntConsumer;
@@ -86,12 +88,13 @@ public class FormMap extends Form {
     private static final Duration REMOTE_RPC_TIMEOUT = Duration.ofSeconds(15);
     private static final double STATUS_LEGEND_WIDTH = 260;
     private static final Pattern TRACE_SEGMENT_PATTERN = Pattern.compile(" →(-?\\d+[.,]\\d+)dB→ | → ");
-    private static final Pattern TRACE_NODE_ID_PATTERN = Pattern.compile("!([0-9a-fA-F]{1,8})");
+    private static final Pattern TRACE_NODE_ID_PATTERN = Pattern.compile("!([0-9a-fA-F]{1,8})(?![0-9a-fA-F])");
     private static final Pattern TRACE_SECTION_LABEL_PATTERN =
             Pattern.compile("(?iu)^\\s*(?:прямой|обратный|forward|reverse)\\s*:\\s*");
 
     private final TileMapView mapView = new TileMapView();
     private final Label statusLabel = new Label();
+    private final Label traceSummaryLabel = new Label();
     private final Label pointerLabel = new Label();
     private final Label measureLabel = new Label();
     private final Label areaLabel = new Label();
@@ -353,7 +356,14 @@ public class FormMap extends Form {
         statusBar.setAlignment(Pos.CENTER_LEFT);
         HBox.setHgrow(tileDirectoryLabel, Priority.ALWAYS);
 
-        VBox content = new VBox(8, toolbar, mapView, statusBar);
+        traceSummaryLabel.getStyleClass().add("map-status-label");
+        traceSummaryLabel.setWrapText(true);
+        traceSummaryLabel.setMaxWidth(Double.MAX_VALUE);
+        traceSummaryLabel.setMinHeight(javafx.scene.layout.Region.USE_PREF_SIZE);
+        traceSummaryLabel.setVisible(false);
+        traceSummaryLabel.setManaged(false);
+
+        VBox content = new VBox(8, toolbar, mapView, traceSummaryLabel, statusBar);
         content.setPadding(new Insets(10));
         VBox.setVgrow(mapView, Priority.ALWAYS);
         getChildren().setAll(content);
@@ -592,10 +602,14 @@ public class FormMap extends Form {
      */
     private String traceMenuTitle(ParsedTrace trace) {
         int linkCount = trace.paths().stream()
-                .mapToInt(path -> Math.max(0, path.names().size() - 1))
+                .mapToInt(path -> Math.max(0, path.nodes().size() - 1))
                 .sum();
         String suffix = linkCount + " " + pluralUnit("map.trace.link", linkCount);
-        return NodeData.formatTime(trace.timestamp()) + " · " + trace.targetName() + " · " + suffix;
+        return traceLabel(trace) + " · " + trace.targetName() + " · " + suffix;
+    }
+
+    private String traceLabel(ParsedTrace trace) {
+        return "#" + trace.dbId() + " · " + NodeData.formatTime(trace.timestamp());
     }
 
     /**
@@ -771,25 +785,28 @@ public class FormMap extends Form {
         // Try to recover old or corrupted rows from formatted_text below.
             }
         }
-        return Optional.ofNullable(parseTraceText(
+        ParsedTrace legacy = parseTraceText(
                 record.id(),
                 record.timestamp(),
                 record.formattedText(),
-                record.targetName()));
+                record.targetName());
+        return Optional.ofNullable(legacy == null ? null : anchorTraceEndpoints(legacy, record));
     }
 
     private ParsedTrace parseTraceRoute(MessageDbService.TracerouteResultRecord record,
                                         MeshProtos.RouteDiscovery route) {
         String targetName = firstNonBlank(record.targetName(), record.targetNodeId(), I18n.t("map.trace.targetFallback"));
+        TraceNodeRef owner = traceOwnerRef(record);
+        TraceNodeRef target = traceTargetRef(record, targetName);
         List<TracePath> paths = new ArrayList<>();
         paths.add(new TracePath(
                 false,
-                routeNodeNames(traceSelfName(), route.getRouteList(), targetName),
+                routeNodes(owner, route.getRouteList(), target),
                 snrValues(route.getSnrTowardsList())));
         if (route.getRouteBackCount() > 0 || route.getSnrBackCount() > 0) {
             paths.add(new TracePath(
                     true,
-                    routeNodeNames(targetName, route.getRouteBackList(), traceSelfName()),
+                    routeNodes(target, route.getRouteBackList(), owner),
                     snrValues(route.getSnrBackList())));
         }
         return new ParsedTrace(record.id(), targetName, record.timestamp(), List.copyOf(paths));
@@ -827,12 +844,12 @@ public class FormMap extends Form {
         if (forward == null) {
             return null;
         }
-        paths.add(new TracePath(false, forward.names(), forward.snrValues()));
+        paths.add(new TracePath(false, legacyTraceNodes(forward.names()), forward.snrValues()));
 
         for (int i = forwardLineIndex + 1; i < lines.length; i++) {
             ParsedTraceLine back = parseTraceLine(stripTraceSectionLabel(lines[i]));
             if (back != null) {
-                paths.add(new TracePath(true, back.names(), back.snrValues()));
+                paths.add(new TracePath(true, legacyTraceNodes(back.names()), back.snrValues()));
                 break;
             }
         }
@@ -845,16 +862,51 @@ public class FormMap extends Form {
         );
     }
 
-    private List<String> routeNodeNames(String firstName, List<Integer> intermediateNodeNums, String lastName) {
-        List<String> names = new ArrayList<>();
-        names.add(firstName);
+    private TraceNodeRef traceOwnerRef(MessageDbService.TracerouteResultRecord record) {
+        String ownerId = firstNonBlank(record.ownerNodeId(), currentOwnerNodeId());
+        return new TraceNodeRef(extractTraceNodeId(ownerId), traceSelfName());
+    }
+
+    private TraceNodeRef traceTargetRef(MessageDbService.TracerouteResultRecord record, String name) {
+        String targetId = extractTraceNodeId(record.targetNodeId());
+        if (targetId == null && record.targetNodeNum() != 0) {
+            targetId = nodeIdFromNum((int) record.targetNodeNum());
+        }
+        return new TraceNodeRef(targetId, name);
+    }
+
+    private ParsedTrace anchorTraceEndpoints(ParsedTrace trace, MessageDbService.TracerouteResultRecord record) {
+        TraceNodeRef owner = traceOwnerRef(record);
+        TraceNodeRef target = traceTargetRef(record, trace.targetName());
+        List<TracePath> paths = new ArrayList<>();
+        for (TracePath path : trace.paths()) {
+            List<TraceNodeRef> nodes = new ArrayList<>(path.nodes());
+            // Stable endpoint IDs take precedence over the names in old formatted text.
+            if (owner.nodeId() != null) {
+                nodes.set(path.reverse() ? nodes.size() - 1 : 0, owner);
+            }
+            if (target.nodeId() != null) {
+                nodes.set(path.reverse() ? 0 : nodes.size() - 1, target);
+            }
+            paths.add(new TracePath(path.reverse(), List.copyOf(nodes), path.snrValues()));
+        }
+        return new ParsedTrace(trace.dbId(), trace.targetName(), trace.timestamp(), List.copyOf(paths));
+    }
+
+    private List<TraceNodeRef> legacyTraceNodes(List<String> names) {
+        return names.stream().map(name -> new TraceNodeRef(extractTraceNodeId(name), name)).toList();
+    }
+
+    private List<TraceNodeRef> routeNodes(TraceNodeRef first, List<Integer> intermediateNodeNums, TraceNodeRef last) {
+        List<TraceNodeRef> nodes = new ArrayList<>();
+        nodes.add(first);
         for (Integer nodeNum : intermediateNodeNums) {
             if (nodeNum != null) {
-                names.add(traceNodeName(nodeNum));
+                nodes.add(new TraceNodeRef(nodeIdFromNum(nodeNum), traceNodeName(nodeNum)));
             }
         }
-        names.add(lastName);
-        return List.copyOf(names);
+        nodes.add(last);
+        return List.copyOf(nodes);
     }
 
     private List<Double> snrValues(List<Integer> rawValues) {
@@ -950,6 +1002,9 @@ public class FormMap extends Form {
     private void refreshSelectedTraceOverlay(boolean fitAndReport) {
         if (selectedTraces.isEmpty()) {
             mapView.clearTraceSegments();
+            traceSummaryLabel.setText("");
+            traceSummaryLabel.setVisible(false);
+            traceSummaryLabel.setManaged(false);
             if (fitAndReport) {
                 statusLabel.setText(I18n.t("map.trace.hidden"));
             }
@@ -958,29 +1013,26 @@ public class FormMap extends Form {
 
         TraceOverlayBuild build = buildTraceOverlay();
         mapView.setTraceSegments(build.segments());
-        if (!fitAndReport) {
-            return;
+        traceSummaryLabel.setVisible(true);
+        traceSummaryLabel.setManaged(true);
+        if (fitAndReport && !build.segments().isEmpty()) {
+            mapView.fitTraceSegments();
         }
-
-        if (build.segments().isEmpty()) {
-            statusLabel.setText(I18n.t("map.trace.noCoordinates"));
-            return;
-        }
-        mapView.fitTraceSegments();
         String skipped = build.skippedPoints() > 0
                 ? I18n.t("map.trace.skippedPoints", build.skippedPoints())
                 : "";
-        statusLabel.setText(I18n.t("map.trace.shown",
+        String summary = I18n.t("map.trace.shown",
                 selectedTraces.size(),
                 build.totalHops(),
                 build.segments().size(),
-                skipped));
+                skipped);
+        traceSummaryLabel.setText(build.segments().isEmpty()
+                ? summary + " · " + I18n.t("map.trace.noCoordinates")
+                : summary);
     }
 
     /**
-     * Builds all visual segments for selected traces.
-     * If no explicit reverse trace exists, a synthetic reverse direction without
-     * SNR is added so both arrows are visible on the map.
+     * Builds visual segments only for the paths present in the saved result.
      */
     private TraceOverlayBuild buildTraceOverlay() {
         TraceNodeIndex index = buildTraceNodeIndex();
@@ -991,17 +1043,8 @@ public class FormMap extends Form {
 
         for (ParsedTrace trace : selectedTraces.values()) {
             totalHops += traceHopCount(trace);
-            boolean hasExplicitReverse = false;
             for (TracePath path : trace.paths()) {
-                hasExplicitReverse = hasExplicitReverse || path.reverse();
                 skippedPoints += appendTracePathSegments(index, segments, trace, path, traceIndex);
-            }
-            if (!hasExplicitReverse) {
-                for (TracePath path : trace.paths()) {
-                    if (!path.reverse()) {
-                        skippedPoints += appendTracePathSegments(index, segments, trace, mirroredTracePath(path), traceIndex);
-                    }
-                }
             }
             traceIndex++;
         }
@@ -1015,7 +1058,7 @@ public class FormMap extends Form {
      */
     private int traceHopCount(ParsedTrace trace) {
         return trace.paths().stream()
-                .mapToInt(path -> Math.max(0, path.names().size() - 1))
+                .mapToInt(path -> Math.max(0, path.nodes().size() - 1))
                 .sum();
     }
 
@@ -1033,8 +1076,11 @@ public class FormMap extends Form {
                                         int traceIndex) {
         int skippedPoints = 0;
         List<TracePoint> points = new ArrayList<>();
-        for (int i = 0; i < path.names().size(); i++) {
-            NodeData node = resolveTraceNode(path.names().get(i), index);
+        for (int i = 0; i < path.nodes().size(); i++) {
+            TraceNodeRef ref = path.nodes().get(i);
+            NodeData node = ref.nodeId() != null
+                    ? resolveTraceNodeId(ref.nodeId(), index)
+                    : resolveTraceNode(ref.name(), index);
             if (hasCoordinate(node)) {
                 points.add(new TracePoint(node, i));
             } else {
@@ -1050,8 +1096,9 @@ public class FormMap extends Form {
                     from.sourceIndex(),
                     to.sourceIndex(),
                     path.reverse(),
-                    Math.max(0, path.names().size() - 1)
+                    Math.max(0, path.nodes().size() - 1)
             );
+            int hiddenHopCount = to.sourceIndex() - from.sourceIndex() - 1;
             segments.add(new TileMapView.TraceSegment(
                     new TileMapView.GeoPoint(from.node().getLatitude(), from.node().getLongitude()),
                     new TileMapView.GeoPoint(to.node().getLatitude(), to.node().getLongitude()),
@@ -1061,7 +1108,11 @@ public class FormMap extends Form {
                     signal.text(),
                     signal.snr(),
                     path.reverse(),
-                    traceIndex
+                    traceIndex,
+                    trace.dbId(),
+                    traceLabel(trace),
+                    hiddenHopCount,
+                    hiddenHopCount > 0 && Double.isFinite(signal.snr())
             ));
         }
         return skippedPoints;
@@ -1087,23 +1138,16 @@ public class FormMap extends Form {
             }
         }
         double snr = count > 0 ? sum / count : Double.NaN;
-        return new TraceSignal(formatTraceSignal(snr, reverse, totalHops), snr);
-    }
-
-    /**
-     * Creates a synthetic reverse path from the forward route.
-     * SNR for this path is unknown and is marked as {@link Double#NaN}.
-     */
-    private TracePath mirroredTracePath(TracePath path) {
-        List<String> names = new ArrayList<>();
-        for (int i = path.names().size() - 1; i >= 0; i--) {
-            names.add(path.names().get(i));
+        int hiddenHopCount = toIndex - fromIndex - 1;
+        String signal = formatTraceSignal(snr, reverse, totalHops);
+        if (hiddenHopCount > 0) {
+            signal = I18n.t("map.trace.coordinateGap", hiddenHopCount) + " · "
+                    + (count > 0
+                    ? I18n.t("map.trace.meanSnr", count, String.format(I18n.locale(), "%.1f", snr), I18n.t("node.unit.db"))
+                    : I18n.t("map.trace.snrUnavailable"))
+                    + " · " + I18n.t(reverse ? "map.trace.direction.reverse" : "map.trace.direction.forward");
         }
-        List<Double> snrs = new ArrayList<>();
-        for (int i = 0; i < Math.max(0, names.size() - 1); i++) {
-            snrs.add(Double.NaN);
-        }
-        return new TracePath(true, List.copyOf(names), List.copyOf(snrs));
+        return new TraceSignal(signal, snr);
     }
 
     /**
@@ -1115,6 +1159,9 @@ public class FormMap extends Form {
         if (state != null) {
             state.getNodeDb().values().forEach(node -> nodesByNum.put(node.getNodeNum(), node));
         }
+        for (NodeData node : remoteNodeSnapshot) {
+            nodesByNum.putIfAbsent(node.getNodeNum(), node);
+        }
         NodeCacheService cache = NodeCacheService.getInstance();
         for (NodeData node : cache.getAll()) {
             nodesByNum.putIfAbsent(node.getNodeNum(), node);
@@ -1124,31 +1171,41 @@ public class FormMap extends Form {
         }
 
         List<NodeData> nodes = new ArrayList<>(nodesByNum.values());
+        Map<String, NodeData> byId = new LinkedHashMap<>();
         Map<String, NodeData> byToken = new LinkedHashMap<>();
+        Set<String> ambiguousTokens = new HashSet<>();
         for (NodeData node : nodes) {
-            putTraceLookupToken(byToken, node.getNodeId(), node);
-            putTraceLookupToken(byToken, node.getLongName(), node);
-            putTraceLookupToken(byToken, node.getShortName(), node);
-            putTraceLookupToken(byToken, nodeTitle(node), node);
+            byId.put(nodeIdFromNum(node.getNodeNum()), node);
+            putTraceLookupToken(byToken, ambiguousTokens, node.getNodeId(), node);
+            putTraceLookupToken(byToken, ambiguousTokens, node.getLongName(), node);
+            putTraceLookupToken(byToken, ambiguousTokens, node.getShortName(), node);
+            putTraceLookupToken(byToken, ambiguousTokens, nodeTitle(node), node);
         }
 
-        NodeData localNode = state != null ? state.getNodeDb().get(localNodeNum) : null;
-        if (localNode != null) {
-            putTraceLookupToken(byToken, "Я", localNode);
-            putTraceLookupToken(byToken, "Me", localNode);
-            putTraceLookupToken(byToken, traceSelfName(), localNode);
+        NodeData localNode = resolveLocalNode();
+        if (localNode == null) {
+            localNode = byId.get(extractTraceNodeId(currentOwnerNodeId()));
         }
-        return new TraceNodeIndex(List.copyOf(nodes), byToken, localNode);
+        return new TraceNodeIndex(List.copyOf(nodes), byId, byToken, ambiguousTokens, localNode);
     }
 
     /**
      * Adds a normalized node search token to the trace index.
      */
-    private void putTraceLookupToken(Map<String, NodeData> byToken, String token, NodeData node) {
+    private void putTraceLookupToken(Map<String, NodeData> byToken, Set<String> ambiguousTokens, String token, NodeData node) {
         String normalized = normalizeTraceToken(token);
-        if (!normalized.isBlank() && node != null) {
-            byToken.putIfAbsent(normalized, node);
+        if (!normalized.isBlank() && node != null && !ambiguousTokens.contains(normalized)) {
+            NodeData previous = byToken.putIfAbsent(normalized, node);
+            if (previous != null && previous.getNodeNum() != node.getNodeNum()) {
+                byToken.remove(normalized);
+                ambiguousTokens.add(normalized);
+            }
         }
+    }
+
+    private NodeData resolveTraceNodeId(String nodeId, TraceNodeIndex index) {
+        NodeData node = index.byId().get(nodeId);
+        return node != null ? node : NodeCacheService.getInstance().get(nodeId);
     }
 
     /**
@@ -1167,11 +1224,10 @@ public class FormMap extends Form {
 
         String nodeId = extractTraceNodeId(name);
         if (nodeId != null) {
-            NodeData node = index.byToken().get(normalizeTraceToken(nodeId));
-            if (node != null) {
-                return node;
-            }
-            return NodeCacheService.getInstance().get(nodeId);
+            return resolveTraceNodeId(nodeId, index);
+        }
+        if (index.ambiguousTokens().contains(normalized)) {
+            return null;
         }
 
         NodeData exact = index.byToken().get(normalized);
@@ -1720,10 +1776,13 @@ public class FormMap extends Form {
      * One trace path.
      *
      * @param reverse   {@code true} for the reverse path
-     * @param names     node names in route order
+     * @param nodes     stable node identities and display names in route order
      * @param snrValues SNR between adjacent nodes; {@link Double#NaN} when absent
      */
-    private record TracePath(boolean reverse, List<String> names, List<Double> snrValues) {
+    private record TraceNodeRef(String nodeId, String name) {
+    }
+
+    private record TracePath(boolean reverse, List<TraceNodeRef> nodes, List<Double> snrValues) {
     }
 
     /**
@@ -1747,7 +1806,8 @@ public class FormMap extends Form {
     /**
      * Index for fast node lookup by different name variants found in traces.
      */
-    private record TraceNodeIndex(List<NodeData> nodes, Map<String, NodeData> byToken, NodeData localNode) {
+    private record TraceNodeIndex(List<NodeData> nodes, Map<String, NodeData> byId,
+                                  Map<String, NodeData> byToken, Set<String> ambiguousTokens, NodeData localNode) {
     }
 
     /**
